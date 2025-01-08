@@ -1,6 +1,4 @@
-PAGE_SIZE = 60
-ACCESS_TOKEN = "***REMOVED***
-USER_ID = "***REMOVED***"
+PAGE_SIZE = 65
 INCLUDE_PHOTOS = False
 
 import argparse
@@ -9,6 +7,24 @@ import json
 from datetime import datetime
 import os
 from pathlib import Path
+
+import json
+import os
+
+def load_credentials():
+    try:
+        with open('config.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        template = {
+            "access_token": "your-access-token-here",
+            "user_id": "your-user-id-here"
+        }
+        print("Error: missing config.json. Creating one for you.")
+        with open('config.json', 'w') as f:
+            json.dump(template, f, indent=2)
+        print("Please edit config.json and replace the placeholder values with your credentials.")
+        raise SystemExit(1)
 
 class GoProAPI:
     def __init__(self, access_token, user_id):
@@ -27,7 +43,7 @@ class GoProAPI:
             "Referer": "https://gopro.com/"
         }
     
-    def get_videos(self, page=1, per_page=PAGE_SIZE):
+    def get_items(self, page=1, per_page=PAGE_SIZE, include_photos=False):
         """Get list of videos with pagination"""
         types = "Burst,BurstVideo,Continuous,LoopedVideo,TimeLapse,TimeLapseVideo,Video"
         if INCLUDE_PHOTOS:
@@ -55,8 +71,8 @@ class GoProAPI:
             
         return response.json()
 
-    def download_media(self, media_item, item_path):
-        """Download both the video and its GPMF data"""
+    def download_media(self, media_item, item_path, download_gpmf=False):
+        """Download both the video and optionally its GPMF data"""
         # Get download info
         response = requests.get(
             f"{self.base_url}/media/{media_item['id']}/download",
@@ -77,16 +93,17 @@ class GoProAPI:
         # print("JSON: ", json.dumps(response_json, indent=2, sort_keys=True))  # sort_keys=True is optional but makes it even more readable
 
         # Download GPMF data if available
-        gpmf_url = self.get_gpmf_url(response_json)
-        if gpmf_url:
-            p = Path(item_path)
-            gpmf_path = p.with_name(f"{p.stem}_gpmf{p.suffix}")
-            self._download_file(gpmf_url, gpmf_path)
+        if download_gpmf:
+            gpmf_url = self.get_gpmf_url(response_json)
+            if gpmf_url:
+                p = Path(item_path)
+                gpmf_path = p.with_name(f"{p.stem}_gpmf{p.suffix}")
+                self._download_file(gpmf_url, gpmf_path)
 
-            if gpmf_path.exists():
-                highlights = self.extract_gpmf_data(gpmf_path)
-                if highlights:
-                    print(f"Found {len(highlights)} HiLight tags")
+                if gpmf_path.exists():
+                    highlights = self.extract_gpmf_data(gpmf_path)
+                    if highlights:
+                        print(f"Found {len(highlights)} HiLight tags")
 
     def _download_file(self, url, output_path):
         """Helper method to download a file with progress indicator"""
@@ -193,10 +210,16 @@ class GoProAPI:
 
 def main():
     parser = argparse.ArgumentParser(description="GoPro Media Downloader and GPMF Extractor")
+    parser.add_argument('-o', '--output-folder', type=str, default='gopro_downloads', help="Path to the output folder")
+    parser.add_argument('--download-gpmf', action='store_true', help="Opt into downloading GPMF and extracting its data")
     parser.add_argument('--extract-gpmf', type=str, help="Path to the video file to extract GPMF data from")
+    parser.add_argument('-p', '--photos', action='store_true', help="Include photos")
     args = parser.parse_args()
 
-    gopro = GoProAPI(ACCESS_TOKEN, USER_ID)
+    creds = load_credentials()
+    access_token = creds['access_token']
+    user_id = creds['user_id']
+    gopro = GoProAPI(access_token, user_id)
 
     if args.extract_gpmf:
         highlights = gopro.extract_gpmf_data(args.extract_gpmf)
@@ -207,17 +230,17 @@ def main():
         return
 
     # Create output directory
-    output_dir = Path("gopro_downloads")
+    output_dir = Path(args.output_folder)
     output_dir.mkdir(exist_ok=True)
     
     try:
-        # Get first page of videos and print the full response to see its structure
-        videos = gopro.get_videos(page=1)
+        # Get first page of items and print the full response to see its structure
+        items_response = gopro.get_items(page=1, include_photos=args.photos)
         # print("API Response structure:")
-        # print(json.dumps(videos, indent=2))
+        # print(json.dumps(items_response, indent=2))
         
-        # Process videos based on the actual response structure
-        media_items = videos.get('_embedded', {}).get('media', [])
+        # Process items based on the actual response structure
+        media_items = items_response.get('_embedded', {}).get('media', [])
         print(f"Found {len(media_items)} media items")
         
         existing_items = 0
@@ -231,7 +254,6 @@ def main():
                 if not highlights_path.exists():
                     print('Found', media_item['moments_count'], 'HiLight tags in', filename)
                     highlights = gopro.get_video_highlights(media_item['id'])
-                    print('Moments', json.dumps(highlights, indent=2))
                     with open(highlights_path, 'w') as f:
                         json.dump(highlights, f, indent=2)
             
@@ -244,7 +266,7 @@ def main():
             # Download the media
             media_path = output_dir / f"{filename}.{extension}"
             if not media_path.exists():  # Skip if already downloaded
-                gopro.download_media(media_item, media_path)
+                gopro.download_media(media_item, media_path, args.download_gpmf)
             else:
                 existing_items += 1
         
