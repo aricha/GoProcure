@@ -1,8 +1,9 @@
-PAGE_SIZE = 50
+PAGE_SIZE = 60
 ACCESS_TOKEN = "***REMOVED***
 USER_ID = "***REMOVED***"
 INCLUDE_PHOTOS = False
 
+import argparse
 import requests
 import json
 from datetime import datetime
@@ -176,11 +177,35 @@ class GoProAPI:
         except Exception as e:
             print(f"Error extracting GPMF data: {e}")
             return None
+        
+    def get_video_highlights(self, video_id):
+        """Get HiLight moments for a specific video"""
+        response = requests.get(
+            f"{self.base_url}/media/{video_id}/moments?fields=time&per_page=100",
+            headers=self.get_headers(),
+            cookies=self.cookies
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        
+        return None
 
 def main():
-    # Initialize API client
+    parser = argparse.ArgumentParser(description="GoPro Media Downloader and GPMF Extractor")
+    parser.add_argument('--extract-gpmf', type=str, help="Path to the video file to extract GPMF data from")
+    args = parser.parse_args()
+
     gopro = GoProAPI(ACCESS_TOKEN, USER_ID)
-    
+
+    if args.extract_gpmf:
+        highlights = gopro.extract_gpmf_data(args.extract_gpmf)
+        if highlights:
+            print(f"Found {len(highlights)} HiLight tags")
+        else:
+            print("No HiLight tags found")
+        return
+
     # Create output directory
     output_dir = Path("gopro_downloads")
     output_dir.mkdir(exist_ok=True)
@@ -202,7 +227,13 @@ def main():
             extension = media_item['file_extension'].lower()
 
             if media_item['moments_count'] > 0:
-                print('Found', media_item['moments_count'], 'HiLight tags in', filename)
+                highlights_path = output_dir / f"{filename}_highlights.json"
+                if not highlights_path.exists():
+                    print('Found', media_item['moments_count'], 'HiLight tags in', filename)
+                    highlights = gopro.get_video_highlights(media_item['id'])
+                    print('Moments', json.dumps(highlights, indent=2))
+                    with open(highlights_path, 'w') as f:
+                        json.dump(highlights, f, indent=2)
             
             # Save metadata
             metadata_path = output_dir / f"{filename}_metadata.json"
