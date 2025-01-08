@@ -1,40 +1,60 @@
-PAGE_SIZE = 65
-INCLUDE_PHOTOS = False
-
 import argparse
-import requests
 import json
+import logging
 from datetime import datetime
-import os
 from pathlib import Path
+from typing import Dict, List, Optional
+import requests
+import subprocess
+from dataclasses import dataclass
 
-import json
-import os
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def load_credentials():
-    try:
-        with open('config.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
+@dataclass
+class Config:
+    """Configuration settings for the application"""
+    PAGE_SIZE: int = 70
+    INCLUDE_PHOTOS: bool = False
+    BASE_URL: str = "https://api.gopro.com"
+
+class ConfigManager:
+    """Handles loading and saving of credentials"""
+    def __init__(self, config_path: str = 'config.json'):
+        self.config_path = config_path
+        
+    def load_credentials(self) -> Dict[str, str]:
+        try:
+            with open(self.config_path, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            self._create_template_config()
+            raise SystemExit(1)
+    
+    def _create_template_config(self):
         template = {
             "access_token": "your-access-token-here",
             "user_id": "your-user-id-here"
         }
-        print("Error: missing config.json. Creating one for you.")
-        with open('config.json', 'w') as f:
+        logger.info(f"Creating template config file at {self.config_path}")
+        with open(self.config_path, 'w') as f:
             json.dump(template, f, indent=2)
-        print("Please edit config.json and replace the placeholder values with your credentials.")
-        raise SystemExit(1)
+        logger.info("Please edit config.json and replace the placeholder values with your credentials.")
 
-class GoProAPI:
-    def __init__(self, access_token, user_id):
-        self.base_url = "https://api.gopro.com"
+class GoProAPIClient:
+    """Handles all API interactions with GoPro"""
+    def __init__(self, access_token: str, user_id: str, config: Config):
+        self.config = config
         self.cookies = {
             "gp_access_token": access_token,
             "gp_user_id": user_id
         }
     
-    def get_headers(self):
+    def _get_headers(self) -> Dict[str, str]:
         return {
             "Accept": "application/vnd.gopro.jk.media.search+json; version=2.0.0",
             "Accept-Language": "en-US,en;q=0.9",
@@ -43,70 +63,73 @@ class GoProAPI:
             "Referer": "https://gopro.com/"
         }
     
-    def get_items(self, page=1, per_page=PAGE_SIZE, include_photos=False):
-        """Get list of videos with pagination"""
+    def get_media_items(self, page: int = 1) -> Dict:
+        """Fetch media items with pagination"""
         types = "Burst,BurstVideo,Continuous,LoopedVideo,TimeLapse,TimeLapseVideo,Video"
-        if INCLUDE_PHOTOS:
+        if self.config.INCLUDE_PHOTOS:
             types += ",Photo"
-        
+            
         params = {
             "processing_states": "rendering,pretranscoding,transcoding,stabilizing,ready,failure",
             "fields": "camera_model,captured_at,content_title,content_type,created_at,gopro_user_id,gopro_media,filename,file_extension,file_size,height,fov,id,item_count,mce_type,moments_count,on_public_profile,orientation,play_as,ready_to_edit,ready_to_view,resolution,source_duration,token,type,width,stabilized,submitted_at,thumbnail_available,captured_at_timezone,available_labels",
             "type": types,
             "page": page,
-            "per_page": per_page
+            "per_page": self.config.PAGE_SIZE
         }
         
         response = requests.get(
-            f"{self.base_url}/media/search",
+            f"{self.config.BASE_URL}/media/search",
             params=params,
-            headers=self.get_headers(),
+            headers=self._get_headers(),
             cookies=self.cookies
         )
         
-        if response.status_code != 200:
-            print(f"Response status: {response.status_code}")
-            print(f"Response body: {response.text}")
-            raise Exception(f"Failed to get videos: {response.status_code}")
-            
+        response.raise_for_status()
+        return response.json()
+    
+    def get_download_info(self, media_id: str) -> Dict:
+        """Get download information for a media item"""
+        response = requests.get(
+            f"{self.config.BASE_URL}/media/{media_id}/download",
+            headers=self._get_headers(),
+            cookies=self.cookies
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def get_video_highlights(self, video_id: str) -> Optional[Dict]:
+        """Fetch HiLight moments for a video"""
+        response = requests.get(
+            f"{self.config.BASE_URL}/media/{video_id}/moments?fields=time&per_page=100",
+            headers=self._get_headers(),
+            cookies=self.cookies
+        )
+        response.raise_for_status()
         return response.json()
 
-    def download_media(self, media_item, item_path, download_gpmf=False):
-        """Download both the video and optionally its GPMF data"""
-        # Get download info
-        response = requests.get(
-            f"{self.base_url}/media/{media_item['id']}/download",
-            headers=self.get_headers(),
-            cookies=self.cookies
-        )
+class MediaDownloader:
+    """Handles downloading and processing of media files"""
+    def __init__(self, api_client: GoProAPIClient):
+        self.api_client = api_client
+    
+    def download_media(self, media_item: Dict, output_path: Path, download_gpmf: bool = False):
+        """Download media and optionally its GPMF data"""
+        download_info = self.api_client.get_download_info(media_item['id'])
         
-        if response.status_code != 200:
-            raise Exception(f"Failed to get download URL: {response.status_code} {response.text}")
-        
-        response_json = response.json()
-        
-        # Download main video file
-        video_url = response_json.get('_embedded', {}).get('files', [{}])[0].get('url')
+        # Download main media file
+        video_url = download_info.get('_embedded', {}).get('files', [{}])[0].get('url')
         if video_url:
-            self._download_file(video_url, item_path)
+            self._download_file(video_url, output_path)
         
-        # print("JSON: ", json.dumps(response_json, indent=2, sort_keys=True))  # sort_keys=True is optional but makes it even more readable
-
-        # Download GPMF data if available
+        # Download GPMF data if requested
         if download_gpmf:
-            gpmf_url = self.get_gpmf_url(response_json)
+            gpmf_url = self._get_gpmf_url(download_info)
             if gpmf_url:
-                p = Path(item_path)
-                gpmf_path = p.with_name(f"{p.stem}_gpmf{p.suffix}")
+                gpmf_path = output_path.with_name(f"{output_path.stem}_gpmf{output_path.suffix}")
                 self._download_file(gpmf_url, gpmf_path)
-
-                if gpmf_path.exists():
-                    highlights = self.extract_gpmf_data(gpmf_path)
-                    if highlights:
-                        print(f"Found {len(highlights)} HiLight tags")
-
-    def _download_file(self, url, output_path):
-        """Helper method to download a file with progress indicator"""
+    
+    def _download_file(self, url: str, output_path: Path):
+        """Download a file with progress indication"""
         response = requests.get(url, stream=True)
         total_size = int(response.headers.get('content-length', 0))
         block_size = 8192
@@ -120,162 +143,183 @@ class GoProAPI:
                     downloaded += len(data)
                     f.write(data)
                     percentage = int(100 * downloaded / total_size)
-                    print(f"\rDownloading {output_path}: {percentage}%", end="")
-        print()  # New line after completion
-
-    def get_gpmf_url(self, response_json):
-        """Extract the GPMF sidecar file URL from the download response"""
-        sidecar_files = response_json.get('_embedded', {}).get('sidecar_files', [])
+                    print(f"\rDownloading {output_path.name}: {percentage}%", end="")
+        print()
+    
+    @staticmethod
+    def _get_gpmf_url(download_info: Dict) -> Optional[str]:
+        """Extract GPMF sidecar file URL from download response"""
+        sidecar_files = download_info.get('_embedded', {}).get('sidecar_files', [])
         for file in sidecar_files:
             if file.get('label') == 'gpmf':
                 return file.get('url')
         return None
 
-    def extract_gpmf_data(self, video_path):
-        """Extract GPMF data from MP4 file to find HiLight moments"""
+class GPMFProcessor:
+    """Handles GPMF data extraction and processing"""
+    @staticmethod
+    def extract_gpmf_data(video_path: Path) -> Optional[List[Dict]]:
+        """Extract GPMF data and find HiLight moments"""
         try:
-            # Find the GPMF atom in the MP4
-            import subprocess
-            import json
-            
-            # Use ffprobe to get detailed stream info
-            cmd = [
-                'ffprobe',
-                '-v', 'quiet',
-                '-print_format', 'json',
-                '-show_streams',
-                '-show_format',
-                str(video_path)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            data = json.loads(result.stdout)
-            
-            # Look for GPMF stream
-            gpmf_stream = None
-            for stream in data.get('streams', []):
-                if stream.get('codec_tag_string') == 'gpmd':
-                    gpmf_stream = stream
-                    break
-            
-            if not gpmf_stream:
-                print(f"No GPMF stream found in {video_path}")
+            # Get stream info
+            stream_info = GPMFProcessor._get_stream_info(video_path)
+            if not stream_info:
                 return None
-                
+            
             # Extract GPMF data
-            stream_index = gpmf_stream['index']
-            cmd = [
-                'ffmpeg',
-                '-i', str(video_path),
-                '-map', f'0:{stream_index}',
-                '-codec', 'copy',
-                '-f', 'data',
-                '-'
-            ]
+            gpmf_data = GPMFProcessor._extract_gpmf_stream(video_path, stream_info['index'])
             
-            result = subprocess.run(cmd, capture_output=True)
-            gpmf_data = result.stdout
-            
-            # Now parse the GPMF data
-            # HiLight tags are typically marked with 'HLMT' in the GPMF stream
-            highlights = []
-            for i in range(len(gpmf_data) - 4):
-                tag = gpmf_data[i:i+4]
-                if tag == b'HLMT':
-                    # The timestamp should be nearby in the stream
-                    # This is a simplification - proper GPMF parsing would be more complex
-                    highlights.append({
-                        'offset': i,
-                        'timestamp': None  # Would need proper GPMF parsing to get exact timestamp
-                    })
-            
-            return highlights
+            # Parse HiLight tags
+            return GPMFProcessor._parse_highlights(gpmf_data)
             
         except Exception as e:
-            print(f"Error extracting GPMF data: {e}")
+            logger.error(f"Error extracting GPMF data: {e}")
             return None
+    
+    @staticmethod
+    def _get_stream_info(video_path: Path) -> Optional[Dict]:
+        """Get GPMF stream information using ffprobe"""
+        cmd = [
+            'ffprobe',
+            '-v', 'quiet',
+            '-print_format', 'json',
+            '-show_streams',
+            '-show_format',
+            str(video_path)
+        ]
         
-    def get_video_highlights(self, video_id):
-        """Get HiLight moments for a specific video"""
-        response = requests.get(
-            f"{self.base_url}/media/{video_id}/moments?fields=time&per_page=100",
-            headers=self.get_headers(),
-            cookies=self.cookies
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
         
-        if response.status_code == 200:
-            return response.json()
-        
+        for stream in data.get('streams', []):
+            if stream.get('codec_tag_string') == 'gpmd':
+                return stream
         return None
+    
+    @staticmethod
+    def _extract_gpmf_stream(video_path: Path, stream_index: int) -> bytes:
+        """Extract GPMF stream data using ffmpeg"""
+        cmd = [
+            'ffmpeg',
+            '-i', str(video_path),
+            '-map', f'0:{stream_index}',
+            '-codec', 'copy',
+            '-f', 'data',
+            '-'
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True)
+        return result.stdout
+    
+    @staticmethod
+    def _parse_highlights(gpmf_data: bytes) -> List[Dict]:
+        """Parse GPMF data for HiLight tags"""
+        highlights = []
+        for i in range(len(gpmf_data) - 4):
+            if gpmf_data[i:i+4] == b'HLMT':
+                highlights.append({
+                    'offset': i,
+                    'timestamp': None
+                })
+        return highlights
+
+class MediaProcessor:
+    """Orchestrates the processing of media items"""
+    def __init__(self, api_client: GoProAPIClient, downloader: MediaDownloader, output_dir: Path):
+        self.api_client = api_client
+        self.downloader = downloader
+        self.output_dir = output_dir
+        self.output_dir.mkdir(exist_ok=True)
+    
+    def process_media_items(self, download_gpmf: bool = False):
+        """Process all media items"""
+        try:
+            items_response = self.api_client.get_media_items()
+            media_items = items_response.get('_embedded', {}).get('media', [])
+            logger.info(f"Found {len(media_items)} media items")
+            
+            existing_items = 0
+            for media_item in media_items:
+                if self._process_single_item(media_item, download_gpmf):
+                    existing_items += 1
+            
+            if existing_items > 0:
+                logger.info(f"Skipped downloading {existing_items} existing items")
+                
+        except Exception as e:
+            logger.error(f"Error processing media items: {e}")
+            raise
+    
+    def _process_single_item(self, media_item: Dict, download_gpmf: bool) -> bool:
+        """Process a single media item, returns True if item already existed"""
+        filename = Path(media_item['filename']).with_suffix('').name
+        extension = media_item['file_extension'].lower()
+        
+        # Handle highlights
+        if media_item['moments_count'] > 0:
+            self._save_highlights(media_item, filename)
+        
+        # Save metadata
+        self._save_metadata(media_item, filename)
+        
+        # Download media
+        media_path = self.output_dir / f"{filename}.{extension}"
+        if media_path.exists():
+            return True
+            
+        self.downloader.download_media(media_item, media_path, download_gpmf)
+        return False
+    
+    def _save_highlights(self, media_item: Dict, filename: str):
+        """Save highlights data if available"""
+        highlights_path = self.output_dir / f"{filename}_highlights.json"
+        if not highlights_path.exists():
+            logger.info(f"Found {media_item['moments_count']} HiLight tags in {filename}")
+            highlights = self.api_client.get_video_highlights(media_item['id'])
+            with open(highlights_path, 'w') as f:
+                json.dump(highlights, f, indent=2)
+    
+    def _save_metadata(self, media_item: Dict, filename: str):
+        """Save media item metadata"""
+        metadata_path = self.output_dir / f"{filename}_metadata.json"
+        if not metadata_path.exists():
+            with open(metadata_path, 'w') as f:
+                json.dump(media_item, f, indent=2)
 
 def main():
     parser = argparse.ArgumentParser(description="GoPro Media Downloader and GPMF Extractor")
-    parser.add_argument('-o', '--output-folder', type=str, default='gopro_downloads', help="Path to the output folder")
-    parser.add_argument('--download-gpmf', action='store_true', help="Opt into downloading GPMF and extracting its data")
-    parser.add_argument('--extract-gpmf', type=str, help="Path to the video file to extract GPMF data from")
-    parser.add_argument('-p', '--photos', action='store_true', help="Include photos")
+    parser.add_argument('-o', '--output-folder', type=str, default='gopro_downloads',
+                      help="Path to the output folder")
+    parser.add_argument('--download-gpmf', action='store_true',
+                      help="Opt into downloading GPMF and extracting its data")
+    parser.add_argument('--extract-gpmf', type=str,
+                      help="Path to the video file to extract GPMF data from")
+    parser.add_argument('-p', '--photos', action='store_true',
+                      help="Include photos")
     args = parser.parse_args()
 
-    creds = load_credentials()
-    access_token = creds['access_token']
-    user_id = creds['user_id']
-    gopro = GoProAPI(access_token, user_id)
-
+    # Initialize configuration
+    config = Config(INCLUDE_PHOTOS=args.photos)
+    config_manager = ConfigManager()
+    creds = config_manager.load_credentials()
+    
+    # Handle GPMF extraction request
     if args.extract_gpmf:
-        highlights = gopro.extract_gpmf_data(args.extract_gpmf)
+        video_path = Path(args.extract_gpmf)
+        highlights = GPMFProcessor.extract_gpmf_data(video_path)
         if highlights:
-            print(f"Found {len(highlights)} HiLight tags")
+            logger.info(f"Found {len(highlights)} HiLight tags")
         else:
-            print("No HiLight tags found")
+            logger.info("No HiLight tags found")
         return
 
-    # Create output directory
-    output_dir = Path(args.output_folder)
-    output_dir.mkdir(exist_ok=True)
+    # Initialize components
+    api_client = GoProAPIClient(creds['access_token'], creds['user_id'], config)
+    downloader = MediaDownloader(api_client)
+    processor = MediaProcessor(api_client, downloader, Path(args.output_folder))
     
-    try:
-        # Get first page of items and print the full response to see its structure
-        items_response = gopro.get_items(page=1, include_photos=args.photos)
-        # print("API Response structure:")
-        # print(json.dumps(items_response, indent=2))
-        
-        # Process items based on the actual response structure
-        media_items = items_response.get('_embedded', {}).get('media', [])
-        print(f"Found {len(media_items)} media items")
-        
-        existing_items = 0
-        for media_item in media_items:
-            filename = Path(media_item['filename']).with_suffix('').name
-            # Determine appropriate file extension
-            extension = media_item['file_extension'].lower()
-
-            if media_item['moments_count'] > 0:
-                highlights_path = output_dir / f"{filename}_highlights.json"
-                if not highlights_path.exists():
-                    print('Found', media_item['moments_count'], 'HiLight tags in', filename)
-                    highlights = gopro.get_video_highlights(media_item['id'])
-                    with open(highlights_path, 'w') as f:
-                        json.dump(highlights, f, indent=2)
-            
-            # Save metadata
-            metadata_path = output_dir / f"{filename}_metadata.json"
-            if not metadata_path.exists():
-                with open(metadata_path, 'w') as f:
-                    json.dump(media_item, f, indent=2)
-            
-            # Download the media
-            media_path = output_dir / f"{filename}.{extension}"
-            if not media_path.exists():  # Skip if already downloaded
-                gopro.download_media(media_item, media_path, args.download_gpmf)
-            else:
-                existing_items += 1
-        
-        if existing_items > 0:
-            print("Skipped downloading", existing_items, "existing items")
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        raise e
+    # Process media items
+    processor.process_media_items(args.download_gpmf)
 
 if __name__ == "__main__":
     main()
