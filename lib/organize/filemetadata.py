@@ -9,7 +9,7 @@ from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
 
-class MetadataUpdater:
+class FileMetadataUpdater:
     """Updates media file metadata using exiftool"""
     
     def __init__(self):

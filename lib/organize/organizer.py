@@ -4,7 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator, List, Tuple
 import json
-from .metadata import MetadataUpdater
+from .metadata import FileMetadataUpdater
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class VideoOrganizer:
         self.source_dir = source_dir
         self.copy = copy
         self.dry_run = dry_run
-        self.metadata_updater = MetadataUpdater()
+        self.metadata_updater = FileMetadataUpdater()
         
         # Create base output directory
         self.output_dir = source_dir / 'organized_videos'
