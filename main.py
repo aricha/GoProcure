@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 import requests
 import subprocess
 from dataclasses import dataclass
+import atexit
 
 # Configure logging
 logging.basicConfig(
@@ -18,7 +19,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Config:
     """Configuration settings for the application"""
-    PAGE_SIZE: int = 70
+    PAGE_SIZE: int = 100
+    MAX_ITEMS: int = 1000
     INCLUDE_PHOTOS: bool = False
     BASE_URL: str = "https://api.gopro.com"
 
@@ -62,6 +64,7 @@ class GoProAPIClient:
             "Origin": "https://gopro.com",
             "Referer": "https://gopro.com/"
         }
+        
     
     def get_media_items(self, page: int = 1) -> Dict:
         """Fetch media items with pagination"""
@@ -234,17 +237,19 @@ class MediaProcessor:
     def process_media_items(self, download_gpmf: bool = False):
         """Process all media items"""
         try:
-            items_response = self.api_client.get_media_items()
-            media_items = items_response.get('_embedded', {}).get('media', [])
-            logger.info(f"Found {len(media_items)} media items")
-            
+            num_pages = max(self.api_client.config.MAX_ITEMS // self.api_client.config.PAGE_SIZE, 1)
+            item_count = 0
             existing_items = 0
-            for media_item in media_items:
-                if self._process_single_item(media_item, download_gpmf):
-                    existing_items += 1
-            
-            if existing_items > 0:
-                logger.info(f"Skipped downloading {existing_items} existing items")
+            for page in range(1, num_pages):
+                items_response = self.api_client.get_media_items(page)
+                media_items = items_response.get('_embedded', {}).get('media', [])
+                item_count += len(media_items)
+                
+                for media_item in media_items:
+                    if self._process_single_item(media_item, download_gpmf):
+                        existing_items += 1
+
+            logger.info(f"Found {item_count} media items")
                 
         except Exception as e:
             logger.error(f"Error processing media items: {e}")
@@ -286,6 +291,17 @@ class MediaProcessor:
             with open(metadata_path, 'w') as f:
                 json.dump(media_item, f, indent=2)
 
+def prevent_sleep():
+    # Start caffeinate process
+    caffeinate = subprocess.Popen(['caffeinate', '-i'])
+    
+    # Register cleanup function to kill caffeinate when script exits
+    def cleanup():
+        caffeinate.terminate()
+    atexit.register(cleanup)
+    
+    return caffeinate
+
 def main():
     parser = argparse.ArgumentParser(description="GoPro Media Downloader and GPMF Extractor")
     parser.add_argument('-o', '--output-folder', type=str, default='gopro_downloads',
@@ -296,10 +312,12 @@ def main():
                       help="Path to the video file to extract GPMF data from")
     parser.add_argument('-p', '--photos', action='store_true',
                       help="Include photos")
+    parser.add_argument('-m', '--max-items', type=int, default=Config.MAX_ITEMS,
+                      help="Max items to download")
     args = parser.parse_args()
 
     # Initialize configuration
-    config = Config(INCLUDE_PHOTOS=args.photos)
+    config = Config(INCLUDE_PHOTOS=args.photos,MAX_ITEMS=args.max_items)
     config_manager = ConfigManager()
     creds = config_manager.load_credentials()
     
@@ -317,6 +335,9 @@ def main():
     api_client = GoProAPIClient(creds['access_token'], creds['user_id'], config)
     downloader = MediaDownloader(api_client)
     processor = MediaProcessor(api_client, downloader, Path(args.output_folder))
+
+    # Prevent system from sleeping while downloading
+    prevent_sleep()
     
     # Process media items
     processor.process_media_items(args.download_gpmf)
